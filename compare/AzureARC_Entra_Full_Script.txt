@@ -1,0 +1,269 @@
+﻿param (
+    [Parameter(Mandatory = $true)] [string] $applicationName,
+    [Parameter(Mandatory = $true)] [string] $keyVaultCertificateName,
+    [Parameter(Mandatory = $true)] [string] $keyVaultName,
+    [Parameter(Mandatory = $true)] [string] $machineName,
+    [Parameter(Mandatory = $true)] [string] $resourceGroupName,
+    [Parameter(Mandatory = $true)] [string] $adminAccountName,
+    [Parameter(Mandatory = $true)] [string] $instanceName,
+    #[string] $adminAccountSid,
+    [int] $adminAccountType,
+    [string] $tenantId,
+    [string] $subscriptionId
+)
+
+$dateFile = Get-Date -Format "yyyyMMdd-HHmmss"
+#Start-Transcript -Path "transcript-$dateFile.log"
+$filePath = "$instanceName-$dateFile.log"
+
+function AddLog ($message) {
+  Add-Content -Path $filePath -Value "$(Get-Date): $message"
+  Write-Output "$(Get-Date): $message"
+}
+
+# Import required Azure PowerShell modules
+AddLog "Importing Azure PowerShell modules"
+Import-Module Az.Accounts
+Import-Module Az.ConnectedMachine
+Import-Module Az.KeyVault
+Import-Module Az.Resources
+
+#Input parameters
+
+# $subscriptionId="<subscriptionId>"
+# $tenantId="<tenantId>"
+# $machineName="<machineName>"  # hostname
+# $instanceName="<instanceName>"  # SQL Server is define as `machine_name\instance_name $resourceGroupName="<resourceGroupName>"
+# $keyVaultName="<keyVaultName>"
+# $keyVaultCertificateName="<keyVaultCertificateName>" # Your existing certificate name
+# $applicationName="<applicationName>" # Your existing application name
+# $adminAccountName="<adminAccountName>"
+# $adminAccountSid="<adminID>"  # Use object ID for the Microsoft Entra user and group, or client ID for the Microsoft Entra application
+# $adminAccountType= 0  # 0 – for Microsoft Entra user and application, 1 for Microsoft Entra group
+
+# Authenticate to Azure
+AddLog "Authenticating to Azure"
+try {
+    $context = Get-AzContext
+    if (-not $context) {
+        AddLog "Azure Powershell context not found. Logging in using device code authentication."
+        Connect-AzAccount -TenantId $tenantId -SubscriptionId $subscriptionId -ErrorAction Stop -UseDeviceAuthentication
+    }
+    else {
+        if ((-not [string]::IsNullOrEmpty($tenantId)) -or (-not [string]::IsNullOrEmpty($subscriptionId))) {
+            if($context.Tenant.Id -ne $tenantId -or $context.Subscription.Id -ne $subscriptionId) {
+                AddLog "Azure Powershell context found but does not match the provided tenantId and subscriptionId. Logging in using device code authentication."
+                Connect-AzAccount -TenantId $tenantId -SubscriptionId $subscriptionId -ErrorAction Stop -UseDeviceAuthentication
+            }
+        }
+        AddLog "Azure login:"
+        $context | Format-List
+    }
+    #Connect-AzAccount -TenantId $tenantId -SubscriptionId $subscriptionId -ErrorAction Stop -UseDeviceAuthentication
+}
+catch {
+    Write-Error "Azure login failed. Exiting."
+    exit 1
+}
+
+# Retrieve Subscription ID if not provided
+if (-not $subscriptionId) {
+    AddLog "Subscription ID not provided. Retrieving from Azure context."
+    $context = Get-AzContext
+    if ($context -and $context.Subscription) {
+        AddLog "Subscription ID found: $($context.Subscription.Id)"
+        $subscriptionId = $context.Subscription.Id
+    }
+    else {
+        Write-Error "Subscription ID not found. Exiting."
+        exit 1
+    }
+}
+
+# Retrieve tenantId if not provided
+if (-not $tenantId) {
+    AddLog "TenantId not provided. Retrieving from Azure context."
+    $context = Get-AzContext
+    if ($context -and $context.Tenant) {
+        AddLog "TenantId found: $($context.Tenant.Id)"
+        $tenantId = $context.Tenant.Id
+    }
+    else {
+        Write-Error "TenantId ID not found. Exiting."
+        exit 1
+    }
+}
+
+# Check if admin account exists
+#
+AddLog "Loading Admin account from Microsoft Entra account using UserPrincipalName: $adminAccountName"
+$adminAccount = Get-AzADUser -UserPrincipalName $adminAccountName
+$adminAccountType = 0
+
+if (!$adminAccount) {
+    # Check for guest user
+    #
+    AddLog "Admin account not found using UserPrincipalName in Microsoft Entra."
+    AddLog "Loading Admin account from Microsoft Entra using Mail: $adminAccountName"
+    $adminAccount = Get-AzADUser -Mail $adminAccountName
+
+    if (!$adminAccount) {
+        AddLog "Admin account not found using Mail in Microsoft Entra."
+        AddLog "Loading Admin account from Microsoft Entra as group using DisplayName: $adminAccountName"
+        $adminAccount = Get-AzADGroup -DisplayName $adminAccountName
+
+        if (!$adminAccount) {
+            AddLog "Admin account not found as group using DisplayName in Microsoft Entra."
+            AddLog "Loading Admin account from Microsoft Entra as service principal using DisplayName: $adminAccountName"
+            $adminAccount = Get-AzADServicePrincipal -DisplayName $adminAccountName
+        }
+        else {
+            $adminAccountType = 1
+        }
+    }
+}
+
+if ($adminAccount) {
+    if ($adminAccount.Length -gt 1) {
+        Write-Error "Multiple accounts with found with name $adminAccountName"
+        $adminAccount | Format-List
+        exit 1
+    }
+    $adminAccountSid = $adminAccount.Id
+}
+else {
+    Write-Error "Could not find an account with name $adminAccountName"
+    exit 1
+}
+
+# Check parameter $instanceName
+if ([string]::IsNullOrEmpty($instanceName)) {
+    AddLog "Warning: SQL Instance name (-instanceName) not provided. Default of MSSQLSERVER will be used"
+    $instanceName = "MSSQLSERVER"
+}
+
+AddLog "Loading Azure Key Vault $keyVaultName"
+$keyVault = Get-AzKeyVault -VaultName $keyVaultName
+if (!$keyVault) {
+    Write-Error "Supplied key vault was not found in the subscription. Please specify an existing key vault"
+    exit 1
+}
+
+# Retrieve or create certificate in Key Vault
+# Possible option to create a certificate if it does not exist
+AddLog "Loading certificate $keyVaultCertificateName from Key Vault $keyVaultName"
+$cert = Get-AzKeyVaultCertificate -VaultName $keyVaultName -Name $keyVaultCertificateName -ErrorAction SilentlyContinue
+if (-not $cert) {
+    AddLog "Supplied certificate $keyVaultCertificateName was not found for this key vault $keyVaultName. Please specify an existing certificate"
+    Write-Error "Supplied certificate $keyVaultCertificateName was not found for this key vault $keyVaultName. Please specify an existing certificate"
+    exit 1
+}
+
+
+
+AddLog "Validating Certificate Secret ID"
+$secretId = $cert.SecretId
+if ($secretId -Match "(https:\/\/[^\/]+\/secrets\/[^\/]+)(\/.*){0,1}$") {
+    if ($Matches[1]) {
+        $secretId = $Matches[1]
+    }
+}
+
+# Retrieve or create App Registration
+AddLog "Loading Microsoft Entra application $applicationName"
+$application = Get-AzADApplication -DisplayName $applicationName -ErrorAction SilentlyContinue
+if (-not $application) {
+    AddLog "Microsoft Entra application $applicationName not found."
+    Write-Error "Microsoft Entra application $applicationName not found."
+    exit 1
+} else{
+    # Grant Key Vault Access to Arc Machine
+    AddLog "Granting Key Vault access to Microsoft Entra System managed Identity $machineName"
+    $arcServicePrincipal = Get-AzADServicePrincipal -DisplayName $machineName -ErrorAction SilentlyContinue
+    if ($arcServicePrincipal) {
+        Set-AzKeyVaultAccessPolicy -VaultName $keyVaultName -ObjectId $arcServicePrincipal.Id -PermissionsToSecrets Get,List -PermissionsToCertificates Get,List
+    }
+    else {
+        Write-Error "Microsoft Entra System managed Identity $machineName not found. Exiting."
+        exit 1
+    }
+}
+
+# Create the settings object to write to the Arc extension
+$instanceSettings = @{
+    instanceName             = $instanceName
+    adminLoginName           = $adminAccountName
+    adminLoginSid            = $adminAccountSid
+    azureCertSecretId        = $secretId.replace(":443", "")
+    azureCertUri             = $cert.Id.replace(":443", "")
+    azureKeyVaultResourceUID = $keyVault.ResourceId
+    managedCertSetting       = "CUSTOMER MANAGED CERT"
+    managedAppSetting        = "CUSTOMER MANAGED APP"
+    appRegistrationName      = $application.DisplayName
+    appRegistrationSid       = $application.AppId
+    tenantId                 = $tenantId
+    aadkeyVaultCertificateName       = $keyVaultCertificateName
+    adminLoginType           = $adminAccountType
+}
+
+# Retrieve the current settings from the Arc extension
+AddLog "Retrieving current settings from the SQL Server Arc extension"
+$arcInstance = Get-AzConnectedMachineExtension -SubscriptionId $subscriptionId -MachineName $machineName -ResourceGroupName $resourceGroupName -Name "WindowsAgent.SqlServer"
+
+# Update the settings with the new Microsoft Entra settings
+AddLog "Updating Microsoft Entra settings in the SQL Server Arc extension"
+if ($arcInstance.Setting.AdditionalProperties.AzureAD) {
+    $aadSettings = $arcInstance.Setting.AdditionalProperties.AzureAD
+    $instanceFound = $false
+    $instanceNameLower = $instanceName.ToLower()
+    $instanceIndex = 0
+
+    for (($i = 0); $i -lt $aadSettings.Length; $i++) {
+        if ($aadSettings[$i].instanceName.ToLower() -eq $instanceNameLower) {
+            $instanceIndex = $i
+            $instanceFound = $true
+            break
+        }
+    }
+
+    if ($instanceFound) {
+        $aadSettings[$instanceIndex] = $instanceSettings
+    }
+    else {
+        $aadSettings += $instanceSettings
+    }
+
+}
+else {
+    $aadSettings = , $instanceSettings
+}
+
+AddLog "Writing Microsoft Entra setting to SQL Server Arc Extension. This may take several minutes..."
+
+# Push settings to Arc
+#
+try {
+    #set the Entra ID / AzureAD setting in the hash table
+    $SettingsToConfigure = @{
+        AzureAD = $aadSettings
+    }
+
+    #add any non-AzureAD key value pairs back to the hashtable
+    $keys = $arcInstance.Setting.Keys | where-object { $_ -notin ("AzureAD") }
+    foreach ($key in $keys) {
+        $SettingsToConfigure.$key = $arcInstance.Setting["$key"]
+    }
+
+    #Issue the update of the updated settings
+    Update-AzConnectedMachineExtension -MachineName $machineName -Name "WindowsAgent.SqlServer" -ResourceGroupName $resourceGroupName -Setting $SettingsToConfigure
+
+}
+catch {
+    AddLog "Failed to write settings to Arc host"
+    AddLog $_
+    Write-Error $_
+    Write-Error "Failed to write settings to Arc host"
+    exit 1
+}
+
+AddLog "Success"

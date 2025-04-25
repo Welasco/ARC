@@ -1,0 +1,62 @@
+﻿param (
+    [string] $applicationName = "sp-dds-arc-dev",
+    [string] $keyVaultName = "akv-dds",
+    [string] $resourceGroupName = "rg-dds-dev",
+    [string] $adminAccountName = "dyg-dds-contributor-dev",
+    [int]    $adminAccountType = 1,
+    [string] $tenantId = "e7520e4d-d5a0-488d-9e9f-949faae7dce8",
+    [string] $subscriptionId = "b09bcb9d-e055-4950-a9dd-2ab6002ef86c"
+)
+
+$query = @"
+resources
+| where type == 'microsoft.azurearcdata/sqlserverinstances'
+| extend Version = properties.version
+| extend Edition = properties.edition
+| extend containerId = tolower(tostring (properties.containerResourceId))
+| where Version == "SQL Server 2022"
+//| where Edition in ("Enterprise", "Standard")
+| where isnotempty(containerId)
+| project containerId, SQL_instance = properties.instanceName, Version, Edition
+| join kind=inner (
+    resources
+    | where type == "microsoft.hybridcompute/machines"
+    | extend machineId = tolower(tostring(id))
+    | project machineId, Machine_name = name
+)on `$left.containerId == `$right.machineId
+| where machineId contains "rg-dds-dev" 
+| where machineId contains "b09bcb9d-e055-4950-a9dd-2ab6002ef86c"
+"@
+
+$TemplateObject = New-Object PSObject | Select-Object applicationName,keyVaultCertificateName,keyVaultName,machineName,resourceGroupName,adminAccountName,instanceName,adminAccountType,tenantId,subscriptionId
+$machineInstances = Search-AzGraph -Query $query -first 1000 
+
+$csvArray = @()
+
+foreach ($machineInstance in $machineInstances) {
+    $wmachineInstanceobj = $TemplateObject | Select-Object *
+    $wmachineInstanceobj.applicationName = $applicationName
+    $wmachineInstanceobj.keyVaultCertificateName = $("arc-"+$machineInstance.Machine_name+"-pfx")
+    $wmachineInstanceobj.keyVaultName = $keyVaultName
+    $wmachineInstanceobj.machineName = $machineInstance.Machine_name
+    $wmachineInstanceobj.resourceGroupName = $resourceGroupName
+    $wmachineInstanceobj.adminAccountName = $adminAccountName
+    $wmachineInstanceobj.instanceName = $machineInstance.SQL_instance
+    $wmachineInstanceobj.adminAccountType = $adminAccountType
+    $wmachineInstanceobj.tenantId = $tenantId
+    $wmachineInstanceobj.subscriptionId = $subscriptionId
+
+    $csvArray += $wmachineInstanceobj
+}
+$date = Get-Date -Format "yyyyMMdd-HHmmss"
+$csvArray | Export-Csv -Path "SQLInstanceList-$date.csv" -NoTypeInformation -UseQuotes AsNeeded
+#$csvArray | Export-Csv -Path "SQLInstanceList-$date.csv" -NoTypeInformation
+
+#./buildCSVsqlInstances.ps1 -applicationName "SqlArcApp-WIN-2SBEBGDNBG0" -keyVaultCertificateName "ARC-WIN-2SBEBGDNBG0" -keyVaultName "sqlarcentra" -resourceGroupName "UPSARC" -adminAccountName "sqladmin" -adminAccountType 1 -tenantId "xxxxxx" -subscriptionId "xxxxxx"
+
+#Sample header and values
+#applicationName,keyVaultCertificateName,keyVaultName,machineName,resourceGroupName,adminAccountName,instanceName,adminAccountType,tenantId,subscriptionId
+#sp-dds-arc-dev,arc-<ARcMachineName>,akv-dds,CSNT00009596,rg-dds-dev,dyg-dds-contributor-dev,MSSQLSERVER,1,e7520e4d-d5a0-488d-9e9f-949faae7dce8,b09bcb9d-e055-4950-a9dd-2ab6002ef86c
+
+## Delta 
+## Identify was enrolled for Entra - if yes...will it skip or will it replace the info.

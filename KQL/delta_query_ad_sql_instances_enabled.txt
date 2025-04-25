@@ -1,0 +1,6 @@
+resources
+| where type == tolower('Microsoft.HybridCompute/machines/extensions')
+| where name == 'WindowsAgent.SqlServer'
+| mv-expand with_itemindex = i properties.settings.AzureAD
+| extend instanceName = properties_settings_AzureAD.instanceName, aadkeyVaultCertificateName = properties_settings_AzureAD.aadkeyVaultCertificateName, appRegistrationName = properties_settings_AzureAD.appRegistrationName, azureCertSecretId = properties_settings_AzureAD.azureCertSecretId, adminLoginName = properties_settings_AzureAD.adminLoginName, adminLoginType = properties_settings_AzureAD.adminLoginType
+| where instanceName <> ""
