@@ -85,6 +85,7 @@ resources
 
 $r = Search-AzGraph -Query $queryDelta
 
+# need to check if sql is 2022 and if the instance name is empty
 $tQuery = @"
 resources
 | where type == tolower('Microsoft.HybridCompute/machines/extensions')
@@ -96,3 +97,34 @@ resources
 "@
 
 Search-AzGraph -Query $tQuery | ft instanceName, ext_Machine_Name
+
+
+
+
+###########################################################################
+$query = @"
+resources
+| where type == 'microsoft.azurearcdata/sqlserverinstances'
+| extend Version = tostring(properties.version)
+| extend Edition = tostring(properties.edition)
+| extend containerId = tolower(tostring (properties.containerResourceId))
+| where Version == "SQL Server 2022"
+| where isnotempty(containerId)
+| extend SQL_instance = tostring(properties.instanceName)
+| join kind=inner (
+    resources
+    | where type == "microsoft.hybridcompute/machines"
+    | extend machineId = tolower(tostring(id)), Machine_name = name
+)on `$left.containerId == `$right.machineId
+| join kind=inner(
+    resources
+    | where type == tolower('Microsoft.HybridCompute/machines/extensions')
+    | where name == 'WindowsAgent.SqlServer'
+    | mv-expand with_itemindex = i properties.settings.AzureAD
+    | extend AAD_SQL_instanceName = tostring(properties_settings_AzureAD.instanceName), aadkeyVaultCertificateName = properties_settings_AzureAD.aadkeyVaultCertificateName, appRegistrationName = properties_settings_AzureAD.appRegistrationName, azureCertSecretId = properties_settings_AzureAD.azureCertSecretId, adminLoginName = properties_settings_AzureAD.adminLoginName, adminLoginType = properties_settings_AzureAD.adminLoginType, ext_Machine_Name = tostring(split(id,"/",8)[0])
+    | where isempty(AAD_SQL_instanceName) or isnull(AAD_SQL_instanceName)
+)on `$left.Machine_name == `$right.ext_Machine_Name
+| order by Machine_name asc
+"@
+
+Search-AzGraph -Query $Query | ft instanceName, ext_Machine_Name
